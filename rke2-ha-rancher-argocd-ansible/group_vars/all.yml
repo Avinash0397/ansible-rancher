@@ -1,0 +1,110 @@
+---
+# ==============================
+# RKE2 HA cluster settings
+# ==============================
+
+# Production: use a Load Balancer / stable DNS name in front of all 3 RKE2 server nodes.
+# It must forward TCP 9345 and TCP 6443 to all RKE2 server nodes.
+# Lab fallback: first server IP.
+rke2_api_endpoint: "{{ hostvars[groups['rke2_servers'][0]].ansible_host }}"
+
+# Production: keep this fixed and store it in Ansible Vault.
+# Generate: openssl rand -hex 32
+rke2_cluster_token: "CHANGE_ME_USE_ANSIBLE_VAULT_32_BYTE_RANDOM_TOKEN"
+
+# Pin in production after checking Rancher support matrix.
+# Empty value uses the RKE2 stable channel from the installer.
+# Example: "v1.34.8+rke2r2"
+rke2_version: ""
+
+# RKE2 options
+rke2_cni: "canal"
+rke2_profile: "cis"
+rke2_selinux: false
+rke2_write_kubeconfig_mode: "0644"
+
+# Add your LB DNS, node public IPs, private IPs, and Rancher hostname.
+rke2_tls_sans:
+  - "{{ rke2_api_endpoint }}"
+  - "{{ rancher_hostname }}"
+  - "{{ argocd_hostname }}"
+  - "{{ hostvars[groups['rke2_servers'][0]].ansible_host }}"
+  - "{{ hostvars[groups['rke2_servers'][1]].ansible_host }}"
+  - "{{ hostvars[groups['rke2_servers'][2]].ansible_host }}"
+
+# ==============================
+# Helm / Rancher / Argo CD
+# ==============================
+
+helm_version: "v3.18.2"
+
+# Use real DNS in production, example:
+# rancher.company.com and argocd.company.com
+# For lab, nip.io works when public IP is reachable.
+rancher_hostname: "rancher.{{ hostvars[groups['rke2_servers'][0]].ansible_host }}.nip.io"
+argocd_hostname: "argocd.{{ hostvars[groups['rke2_servers'][0]].ansible_host }}.nip.io"
+
+# Production: use Ansible Vault.
+rancher_bootstrap_password: "admin@12345"
+
+# Pin chart versions in production after validation.
+# Empty means latest from repo.
+rancher_chart_version: ""
+cert_manager_chart_version: "v1.20.2"
+argocd_chart_version: ""
+
+# Rancher stable is recommended for production.
+rancher_helm_repo_name: "rancher-stable"
+rancher_helm_repo_url: "https://releases.rancher.com/server-charts/stable"
+
+argocd_helm_repo_name: "argo"
+argocd_helm_repo_url: "https://argoproj.github.io/argo-helm"
+
+cert_manager_helm_repo_name: "jetstack"
+cert_manager_helm_repo_url: "https://charts.jetstack.io"
+
+# ==============================
+# Port forward settings
+# ==============================
+# Port-forward is useful for lab access.
+# Production recommendation: use DNS + Ingress + TLS / LoadBalancer instead.
+enable_port_forward: true
+port_forward_bind_address: "0.0.0.0"
+
+# Browser:
+#   Argo CD:  https://<node1-public-ip>:8080
+#   Rancher: https://<node1-public-ip>:8443
+argocd_forward_port: 8080
+rancher_forward_port: 8443
+
+# ==============================
+# Basic OS hardening / packages
+# ==============================
+common_packages:
+  - curl
+  - wget
+  - ca-certificates
+  - gnupg
+  - lsb-release
+  - tar
+  - unzip
+  - jq
+  - socat
+  - conntrack
+  - iptables
+  - iproute2
+  - chrony
+
+# Optional firewall opening. If ufw is active, these will be opened.
+rke2_firewall_ports:
+  - "22/tcp"
+  - "80/tcp"
+  - "443/tcp"
+  - "6443/tcp"
+  - "9345/tcp"
+  - "2379/tcp"
+  - "2380/tcp"
+  - "8472/udp"
+  - "10250/tcp"
+  - "{{ argocd_forward_port }}/tcp"
+  - "{{ rancher_forward_port }}/tcp"

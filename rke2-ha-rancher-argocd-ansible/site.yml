@@ -1,0 +1,488 @@
+---
+- name: Prepare all RKE2 server nodes
+  hosts: rke2_servers
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Validate 3 RKE2 server nodes are defined
+      ansible.builtin.assert:
+        that:
+          - groups['rke2_servers'] | length == 3
+        fail_msg: "This playbook expects exactly 3 hosts in the rke2_servers group."
+
+    - name: Validate cluster token is changed
+      ansible.builtin.assert:
+        that:
+          - rke2_cluster_token != "CHANGE_ME_USE_ANSIBLE_VAULT_32_BYTE_RANDOM_TOKEN"
+          - rke2_cluster_token | length >= 20
+        fail_msg: "Change rke2_cluster_token in group_vars/all.yml. Production: store it with Ansible Vault."
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+      when: ansible_os_family == "Debian"
+
+    - name: Install common packages
+      ansible.builtin.package:
+        name: "{{ common_packages }}"
+        state: present
+
+    - name: Ensure chrony is enabled
+      ansible.builtin.service:
+        name: chrony
+        state: started
+        enabled: true
+      ignore_errors: true
+
+    - name: Disable swap immediately
+      ansible.builtin.command: swapoff -a
+      changed_when: false
+
+    - name: Disable swap permanently in fstab
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^([^#].*\sswap\s.*)$'
+        replace: '# \1'
+
+    - name: Load kernel modules required by Kubernetes networking
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/k8s.conf
+        mode: "0644"
+        content: |
+          overlay
+          br_netfilter
+
+    - name: modprobe overlay
+      community.general.modprobe:
+        name: overlay
+        state: present
+
+    - name: modprobe br_netfilter
+      community.general.modprobe:
+        name: br_netfilter
+        state: present
+
+    - name: Configure Kubernetes sysctl values
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-kubernetes-rke2.conf
+        mode: "0644"
+        content: |
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward                 = 1
+          vm.swappiness                       = 0
+
+    - name: Apply sysctl values
+      ansible.builtin.command: sysctl --system
+      changed_when: false
+
+    - name: Open firewall ports when ufw is installed and active
+      community.general.ufw:
+        rule: allow
+        port: "{{ item.split('/')[0] }}"
+        proto: "{{ item.split('/')[1] }}"
+      loop: "{{ rke2_firewall_ports }}"
+      when:
+        - ansible_facts.os_family == "Debian"
+      ignore_errors: true
+
+    - name: Create RKE2 config directory
+      ansible.builtin.file:
+        path: /etc/rancher/rke2
+        state: directory
+        mode: "0755"
+
+- name: Install and start first RKE2 server
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Render first server RKE2 config
+      ansible.builtin.template:
+        src: templates/rke2-first-config.yaml.j2
+        dest: /etc/rancher/rke2/config.yaml
+        mode: "0600"
+
+    - name: Download RKE2 installer
+      ansible.builtin.get_url:
+        url: https://get.rke2.io
+        dest: /tmp/install-rke2.sh
+        mode: "0755"
+
+    - name: Install RKE2 server using pinned version
+      ansible.builtin.command: /tmp/install-rke2.sh
+      environment:
+        INSTALL_RKE2_TYPE: server
+        INSTALL_RKE2_VERSION: "{{ rke2_version }}"
+      args:
+        creates: /usr/local/bin/rke2
+      when: rke2_version | length > 0
+
+    - name: Install RKE2 server using stable channel
+      ansible.builtin.command: /tmp/install-rke2.sh
+      environment:
+        INSTALL_RKE2_TYPE: server
+        INSTALL_RKE2_CHANNEL: stable
+      args:
+        creates: /usr/local/bin/rke2
+      when: rke2_version | length == 0
+
+    - name: Enable and start first RKE2 server
+      ansible.builtin.systemd:
+        name: rke2-server
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Wait for Kubernetes API on first server
+      ansible.builtin.wait_for:
+        host: "127.0.0.1"
+        port: 6443
+        timeout: 600
+
+    - name: Wait until node token exists
+      ansible.builtin.wait_for:
+        path: /var/lib/rancher/rke2/server/node-token
+        timeout: 300
+
+    - name: Create kubectl symlink
+      ansible.builtin.file:
+        src: /var/lib/rancher/rke2/bin/kubectl
+        dest: /usr/local/bin/kubectl
+        state: link
+        force: true
+
+    - name: Create crictl symlink
+      ansible.builtin.file:
+        src: /var/lib/rancher/rke2/bin/crictl
+        dest: /usr/local/bin/crictl
+        state: link
+        force: true
+
+    - name: Ensure root kube directory exists
+      ansible.builtin.file:
+        path: /root/.kube
+        state: directory
+        mode: "0700"
+
+    - name: Copy kubeconfig for root
+      ansible.builtin.copy:
+        src: /etc/rancher/rke2/rke2.yaml
+        dest: /root/.kube/config
+        remote_src: true
+        mode: "0600"
+
+    - name: Wait for first server node Ready
+      ansible.builtin.command: /var/lib/rancher/rke2/bin/kubectl --kubeconfig=/etc/rancher/rke2/rke2.yaml get nodes
+      register: first_node_check
+      changed_when: false
+      retries: 30
+      delay: 10
+      until: "' Ready ' in first_node_check.stdout or '\tReady\t' in first_node_check.stdout or ' Ready' in first_node_check.stdout"
+
+- name: Install and start remaining RKE2 servers
+  hosts: "{{ groups['rke2_servers'][1:] }}"
+  become: true
+  gather_facts: true
+  serial: 1
+  tasks:
+    - name: Render joining server RKE2 config
+      ansible.builtin.template:
+        src: templates/rke2-join-config.yaml.j2
+        dest: /etc/rancher/rke2/config.yaml
+        mode: "0600"
+
+    - name: Download RKE2 installer
+      ansible.builtin.get_url:
+        url: https://get.rke2.io
+        dest: /tmp/install-rke2.sh
+        mode: "0755"
+
+    - name: Install RKE2 server using pinned version
+      ansible.builtin.command: /tmp/install-rke2.sh
+      environment:
+        INSTALL_RKE2_TYPE: server
+        INSTALL_RKE2_VERSION: "{{ rke2_version }}"
+      args:
+        creates: /usr/local/bin/rke2
+      when: rke2_version | length > 0
+
+    - name: Install RKE2 server using stable channel
+      ansible.builtin.command: /tmp/install-rke2.sh
+      environment:
+        INSTALL_RKE2_TYPE: server
+        INSTALL_RKE2_CHANNEL: stable
+      args:
+        creates: /usr/local/bin/rke2
+      when: rke2_version | length == 0
+
+    - name: Enable and start RKE2 server
+      ansible.builtin.systemd:
+        name: rke2-server
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Wait for Kubernetes API on joining server
+      ansible.builtin.wait_for:
+        host: "127.0.0.1"
+        port: 6443
+        timeout: 600
+
+    - name: Create kubectl symlink
+      ansible.builtin.file:
+        src: /var/lib/rancher/rke2/bin/kubectl
+        dest: /usr/local/bin/kubectl
+        state: link
+        force: true
+
+    - name: Create crictl symlink
+      ansible.builtin.file:
+        src: /var/lib/rancher/rke2/bin/crictl
+        dest: /usr/local/bin/crictl
+        state: link
+        force: true
+
+    - name: Ensure root kube directory exists
+      ansible.builtin.file:
+        path: /root/.kube
+        state: directory
+        mode: "0700"
+
+    - name: Copy kubeconfig for root
+      ansible.builtin.copy:
+        src: /etc/rancher/rke2/rke2.yaml
+        dest: /root/.kube/config
+        remote_src: true
+        mode: "0600"
+
+- name: Install Helm, cert-manager, Rancher, Argo CD, and port-forward services
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Wait until all 3 RKE2 nodes are Ready
+      ansible.builtin.shell: |
+        set -o pipefail
+        /var/lib/rancher/rke2/bin/kubectl --kubeconfig=/etc/rancher/rke2/rke2.yaml get nodes --no-headers | awk '$2=="Ready"{count++} END{print count+0}'
+      args:
+        executable: /bin/bash
+      register: ready_nodes
+      changed_when: false
+      retries: 60
+      delay: 10
+      until: ready_nodes.stdout | int == 3
+
+    - name: Download Helm archive
+      ansible.builtin.get_url:
+        url: "https://get.helm.sh/helm-{{ helm_version }}-linux-amd64.tar.gz"
+        dest: "/tmp/helm-{{ helm_version }}-linux-amd64.tar.gz"
+        mode: "0644"
+
+    - name: Extract Helm
+      ansible.builtin.unarchive:
+        src: "/tmp/helm-{{ helm_version }}-linux-amd64.tar.gz"
+        dest: /tmp
+        remote_src: true
+        creates: /tmp/linux-amd64/helm
+
+    - name: Install Helm binary
+      ansible.builtin.copy:
+        src: /tmp/linux-amd64/helm
+        dest: /usr/local/bin/helm
+        mode: "0755"
+        remote_src: true
+
+    - name: Add cert-manager Helm repo
+      ansible.builtin.command: "helm repo add {{ cert_manager_helm_repo_name }} {{ cert_manager_helm_repo_url }}"
+      environment:
+        KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+      register: cert_repo
+      changed_when: "'has been added' in cert_repo.stdout"
+      failed_when: cert_repo.rc != 0 and 'already exists' not in cert_repo.stderr
+
+    - name: Add Rancher Helm repo
+      ansible.builtin.command: "helm repo add {{ rancher_helm_repo_name }} {{ rancher_helm_repo_url }}"
+      environment:
+        KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+      register: rancher_repo
+      changed_when: "'has been added' in rancher_repo.stdout"
+      failed_when: rancher_repo.rc != 0 and 'already exists' not in rancher_repo.stderr
+
+    - name: Add Argo CD Helm repo
+      ansible.builtin.command: "helm repo add {{ argocd_helm_repo_name }} {{ argocd_helm_repo_url }}"
+      environment:
+        KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+      register: argo_repo
+      changed_when: "'has been added' in argo_repo.stdout"
+      failed_when: argo_repo.rc != 0 and 'already exists' not in argo_repo.stderr
+
+    - name: Update Helm repositories
+      ansible.builtin.command: helm repo update
+      environment:
+        KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+      changed_when: false
+
+    - name: Create cattle-system namespace
+      ansible.builtin.command: /var/lib/rancher/rke2/bin/kubectl --kubeconfig=/etc/rancher/rke2/rke2.yaml create namespace cattle-system
+      register: cattle_ns
+      changed_when: cattle_ns.rc == 0
+      failed_when: cattle_ns.rc != 0 and 'AlreadyExists' not in cattle_ns.stderr
+
+    - name: Create cert-manager namespace
+      ansible.builtin.command: /var/lib/rancher/rke2/bin/kubectl --kubeconfig=/etc/rancher/rke2/rke2.yaml create namespace cert-manager
+      register: cert_ns
+      changed_when: cert_ns.rc == 0
+      failed_when: cert_ns.rc != 0 and 'AlreadyExists' not in cert_ns.stderr
+
+    - name: Create argocd namespace
+      ansible.builtin.command: /var/lib/rancher/rke2/bin/kubectl --kubeconfig=/etc/rancher/rke2/rke2.yaml create namespace argocd
+      register: argocd_ns
+      changed_when: argocd_ns.rc == 0
+      failed_when: argocd_ns.rc != 0 and 'AlreadyExists' not in argocd_ns.stderr
+
+    - name: Install or upgrade cert-manager
+      ansible.builtin.command: >
+        helm upgrade --install cert-manager {{ cert_manager_helm_repo_name }}/cert-manager
+        --namespace cert-manager
+        --version {{ cert_manager_chart_version }}
+        --set crds.enabled=true
+        --wait
+        --timeout 10m
+      environment:
+        KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+      register: cert_install
+      changed_when: "'deployed' in cert_install.stdout or 'upgraded' in cert_install.stdout or cert_install.rc == 0"
+
+    - name: Wait for cert-manager pods
+      ansible.builtin.command: /var/lib/rancher/rke2/bin/kubectl --kubeconfig=/etc/rancher/rke2/rke2.yaml -n cert-manager rollout status deploy/cert-manager --timeout=300s
+      changed_when: false
+
+    - name: Install or upgrade Rancher latest stable chart when chart version is empty
+      ansible.builtin.command: >
+        helm upgrade --install rancher {{ rancher_helm_repo_name }}/rancher
+        --namespace cattle-system
+        --set hostname={{ rancher_hostname }}
+        --set replicas=3
+        --set bootstrapPassword={{ rancher_bootstrap_password }}
+        --set ingress.tls.source=rancher
+        --wait
+        --timeout 20m
+      environment:
+        KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+      when: rancher_chart_version | length == 0
+      register: rancher_install_unpinned
+      changed_when: rancher_install_unpinned.rc == 0
+
+    - name: Install or upgrade Rancher pinned chart
+      ansible.builtin.command: >
+        helm upgrade --install rancher {{ rancher_helm_repo_name }}/rancher
+        --namespace cattle-system
+        --version {{ rancher_chart_version }}
+        --set hostname={{ rancher_hostname }}
+        --set replicas=3
+        --set bootstrapPassword={{ rancher_bootstrap_password }}
+        --set ingress.tls.source=rancher
+        --wait
+        --timeout 20m
+      environment:
+        KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+      when: rancher_chart_version | length > 0
+      register: rancher_install_pinned
+      changed_when: rancher_install_pinned.rc == 0
+
+    - name: Install or upgrade Argo CD latest chart when chart version is empty
+      ansible.builtin.command: >
+        helm upgrade --install argocd {{ argocd_helm_repo_name }}/argo-cd
+        --namespace argocd
+        --set global.domain={{ argocd_hostname }}
+        --set server.replicas=2
+        --set repoServer.replicas=2
+        --set applicationSet.replicaCount=2
+        --set redis-ha.enabled=true
+        --set controller.replicas=1
+        --set server.service.type=ClusterIP
+        --wait
+        --timeout 20m
+      environment:
+        KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+      when: argocd_chart_version | length == 0
+      register: argocd_install_unpinned
+      changed_when: argocd_install_unpinned.rc == 0
+
+    - name: Install or upgrade Argo CD pinned chart
+      ansible.builtin.command: >
+        helm upgrade --install argocd {{ argocd_helm_repo_name }}/argo-cd
+        --namespace argocd
+        --version {{ argocd_chart_version }}
+        --set global.domain={{ argocd_hostname }}
+        --set server.replicas=2
+        --set repoServer.replicas=2
+        --set applicationSet.replicaCount=2
+        --set redis-ha.enabled=true
+        --set controller.replicas=1
+        --set server.service.type=ClusterIP
+        --wait
+        --timeout 20m
+      environment:
+        KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+      when: argocd_chart_version | length > 0
+      register: argocd_install_pinned
+      changed_when: argocd_install_pinned.rc == 0
+
+    - name: Wait for Rancher deployment
+      ansible.builtin.command: /var/lib/rancher/rke2/bin/kubectl --kubeconfig=/etc/rancher/rke2/rke2.yaml -n cattle-system rollout status deploy/rancher --timeout=600s
+      changed_when: false
+
+    - name: Wait for Argo CD server deployment
+      ansible.builtin.command: /var/lib/rancher/rke2/bin/kubectl --kubeconfig=/etc/rancher/rke2/rke2.yaml -n argocd rollout status deploy/argocd-server --timeout=600s
+      changed_when: false
+
+    - name: Create Argo CD port-forward service
+      ansible.builtin.template:
+        src: templates/port-forward.service.j2
+        dest: /etc/systemd/system/argocd-port-forward.service
+        mode: "0644"
+      vars:
+        namespace: argocd
+        service_name: argocd-server
+        local_port: "{{ argocd_forward_port }}"
+        remote_port: 443
+      when: enable_port_forward | bool
+
+    - name: Create Rancher port-forward service
+      ansible.builtin.template:
+        src: templates/port-forward.service.j2
+        dest: /etc/systemd/system/rancher-port-forward.service
+        mode: "0644"
+      vars:
+        namespace: cattle-system
+        service_name: rancher
+        local_port: "{{ rancher_forward_port }}"
+        remote_port: 443
+      when: enable_port_forward | bool
+
+    - name: Enable and start Argo CD port-forward
+      ansible.builtin.systemd:
+        name: argocd-port-forward
+        enabled: true
+        state: restarted
+        daemon_reload: true
+      when: enable_port_forward | bool
+
+    - name: Enable and start Rancher port-forward
+      ansible.builtin.systemd:
+        name: rancher-port-forward
+        enabled: true
+        state: restarted
+        daemon_reload: true
+      when: enable_port_forward | bool
+
+    - name: Show access details
+      ansible.builtin.debug:
+        msg:
+          - "Rancher URL through port-forward: https://{{ hostvars[groups['rke2_servers'][0]].ansible_host }}:{{ rancher_forward_port }}"
+          - "Rancher hostname configured in chart: https://{{ rancher_hostname }}"
+          - "Argo CD URL through port-forward: https://{{ hostvars[groups['rke2_servers'][0]].ansible_host }}:{{ argocd_forward_port }}"
+          - "Argo CD initial admin password command: kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d"

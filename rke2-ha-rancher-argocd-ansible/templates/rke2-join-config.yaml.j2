@@ -1,0 +1,22 @@
+server: "https://{{ rke2_api_endpoint }}:9345"
+token: "{{ rke2_cluster_token }}"
+write-kubeconfig-mode: "{{ rke2_write_kubeconfig_mode }}"
+node-name: "{{ inventory_hostname }}"
+node-ip: "{{ node_ip | default(ansible_default_ipv4.address) }}"
+advertise-address: "{{ node_ip | default(ansible_default_ipv4.address) }}"
+cni: "{{ rke2_cni }}"
+profile: "{{ rke2_profile }}"
+disable:
+  - rke2-ingress-nginx
+tls-san:
+{% for san in rke2_tls_sans %}
+  - "{{ san }}"
+{% endfor %}
+{% for host in groups['rke2_servers'] %}
+  - "{{ hostvars[host].ansible_host }}"
+{% if hostvars[host].node_ip is defined %}
+  - "{{ hostvars[host].node_ip }}"
+{% endif %}
+{% endfor %}
+etcd-expose-metrics: true
+secrets-encryption: true

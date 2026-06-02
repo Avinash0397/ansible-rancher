@@ -1,0 +1,17 @@
+[Unit]
+Description=kubectl port-forward {{ service_name }} {{ local_port }}:{{ remote_port }}
+After=network-online.target rke2-server.service
+Wants=network-online.target
+Requires=rke2-server.service
+
+[Service]
+Type=simple
+User=root
+Environment=KUBECONFIG=/etc/rancher/rke2/rke2.yaml
+Environment=PATH=/var/lib/rancher/rke2/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/var/lib/rancher/rke2/bin/kubectl --kubeconfig=/etc/rancher/rke2/rke2.yaml -n {{ namespace }} port-forward svc/{{ service_name }} {{ local_port }}:{{ remote_port }} --address {{ port_forward_bind_address }}
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
