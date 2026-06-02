@@ -1,0 +1,58 @@
+name: Deploy Rancher Kind Argo CD
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - main
+    paths:
+      - "rancher-kind-azureuser-portforward.yml"
+      - ".github/workflows/deploy-rancher-kind.yml"
+
+jobs:
+  deploy:
+    name: Run Ansible Playbook on Azure VM
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install Ansible
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ansible openssh-client
+
+      - name: Configure SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/azure_vm_key
+          chmod 600 ~/.ssh/azure_vm_key
+          ssh-keyscan -H ${{ secrets.AZURE_VM_IP }} >> ~/.ssh/known_hosts
+
+      - name: Create Ansible inventory
+        run: |
+          cat > inventory.ini <<EOF
+          [rancher_vm]
+          ${{ secrets.AZURE_VM_IP }} ansible_user=${{ secrets.AZURE_VM_USER }} ansible_ssh_private_key_file=~/.ssh/azure_vm_key
+          EOF
+
+          cat inventory.ini
+
+      - name: Test Ansible SSH connection
+        run: |
+          ansible rancher_vm -i inventory.ini -m ping
+
+      - name: Check Ansible playbook syntax
+        run: |
+          ansible-playbook -i inventory.ini rancher-kind-azureuser-portforward.yml --syntax-check
+
+      - name: Run Rancher Kind Argo CD playbook
+        run: |
+          ansible-playbook -i inventory.ini rancher-kind-azureuser-portforward.yml
+
+      - name: Show access URLs
+        run: |
+          echo "Rancher URL: https://${{ secrets.AZURE_VM_IP }}:8443"
+          echo "Argo CD URL: https://${{ secrets.AZURE_VM_IP }}:8080"
