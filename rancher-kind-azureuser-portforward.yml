@@ -1,0 +1,524 @@
+---
+- name: Install Kind Kubernetes with Rancher and Argo CD on Azure Ubuntu VM
+  hosts: all
+  become: yes
+  gather_facts: yes
+
+  vars:
+    remote_user_name: "azureuser"
+
+    kind_cluster_name: "rancher-demo"
+    kind_version: "v0.30.0"
+    kubernetes_version: "v1.34.0"
+    kind_node_image: "kindest/node:v1.34.0"
+
+    kubectl_version: "v1.34.0"
+    helm_version: "v3.18.4"
+
+    rancher_version: "2.13.3"
+    rancher_hostname: "rancher.local"
+    rancher_bootstrap_password: "admin"
+
+    cert_manager_version: "v1.15.3"
+
+    argocd_namespace: "argocd"
+    argocd_version: "v3.3.11"
+
+    # Browser access using persistent kubectl port-forward systemd services
+    rancher_port_forward_host_port: "8443"
+    rancher_port_forward_service_port: "443"
+
+    argocd_port_forward_host_port: "8080"
+    argocd_port_forward_service_port: "443"
+
+  tasks:
+    - name: Show selected versions
+      debug:
+        msg:
+          - "Kind version: {{ kind_version }}"
+          - "Kubernetes version: {{ kubernetes_version }}"
+          - "Kind node image: {{ kind_node_image }}"
+          - "Rancher version: {{ rancher_version }}"
+          - "Argo CD version: {{ argocd_version }}"
+          - "Remote Linux user: {{ remote_user_name }}"
+
+    - name: Install required Ubuntu packages
+      apt:
+        name:
+          - curl
+          - wget
+          - git
+          - ca-certificates
+          - gnupg
+          - lsb-release
+          - apt-transport-https
+          - software-properties-common
+          - conntrack
+          - jq
+          - unzip
+          - iproute2
+        state: present
+        update_cache: yes
+
+    - name: Disable swap
+      command: swapoff -a
+      changed_when: false
+
+    - name: Disable swap permanently in fstab
+      replace:
+        path: /etc/fstab
+        regexp: '^([^#].*\sswap\s.*)$'
+        replace: '# \1'
+
+    - name: Check if Docker is installed
+      command: docker --version
+      register: docker_check
+      failed_when: false
+      changed_when: false
+
+    - name: Install Docker if missing
+      shell: |
+        set -e
+        curl -fsSL https://get.docker.com | sh
+      args:
+        executable: /bin/bash
+      when: docker_check.rc != 0
+
+    - name: Start and enable Docker
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Add azureuser to docker group
+      user:
+        name: "{{ remote_user_name }}"
+        groups: docker
+        append: yes
+
+    - name: Check Docker service
+      command: docker ps
+      changed_when: false
+
+    - name: Install kubectl pinned version
+      shell: |
+        set -e
+        if ! command -v kubectl >/dev/null 2>&1; then
+          curl -L -o /tmp/kubectl "https://dl.k8s.io/release/{{ kubectl_version }}/bin/linux/amd64/kubectl"
+          install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+          rm -f /tmp/kubectl
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: Install Kind pinned version
+      shell: |
+        set -e
+        if ! command -v kind >/dev/null 2>&1; then
+          curl -L -o /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/{{ kind_version }}/kind-linux-amd64"
+          chmod +x /usr/local/bin/kind
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: Install Helm pinned v3 version
+      shell: |
+        set -e
+        if ! command -v helm >/dev/null 2>&1; then
+          curl -L -o /tmp/helm.tar.gz "https://get.helm.sh/helm-{{ helm_version }}-linux-amd64.tar.gz"
+          tar -zxvf /tmp/helm.tar.gz -C /tmp
+          install -o root -g root -m 0755 /tmp/linux-amd64/helm /usr/local/bin/helm
+          rm -rf /tmp/helm.tar.gz /tmp/linux-amd64
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: Create kube directory for root
+      file:
+        path: /root/.kube
+        state: directory
+        mode: "0700"
+
+    - name: Create kube directory for azureuser
+      file:
+        path: "/home/{{ remote_user_name }}/.kube"
+        state: directory
+        owner: "{{ remote_user_name }}"
+        group: "{{ remote_user_name }}"
+        mode: "0755"
+
+    - name: Check if Kind cluster already exists
+      shell: |
+        kind get clusters | grep -w "{{ kind_cluster_name }}"
+      register: kind_cluster_check
+      failed_when: false
+      changed_when: false
+
+    - name: Check if ports 80 and 443 are free before creating Kind cluster
+      shell: |
+        ss -ltn | awk '{print $4}' | grep -E '(:80|:443)$' || true
+      register: port_check
+      changed_when: false
+      when: kind_cluster_check.rc != 0
+
+    - name: Fail if port 80 or 443 is already in use
+      fail:
+        msg: |
+          Port 80 or 443 is already in use on this VM.
+          Stop the existing service first, then rerun the playbook.
+
+          Check with:
+          sudo ss -ltnp | grep -E '(:80|:443)'
+      when:
+        - kind_cluster_check.rc != 0
+        - port_check.stdout | length > 0
+
+    - name: Create Kind cluster config file
+      copy:
+        dest: /tmp/kind-rancher-config.yaml
+        mode: "0644"
+        content: |
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+
+          nodes:
+            - role: control-plane
+              image: {{ kind_node_image }}
+              kubeadmConfigPatches:
+                - |
+                  kind: InitConfiguration
+                  nodeRegistration:
+                    kubeletExtraArgs:
+                      node-labels: "ingress-ready=true"
+              extraPortMappings:
+                - containerPort: 80
+                  hostPort: 80
+                  protocol: TCP
+                - containerPort: 443
+                  hostPort: 443
+                  protocol: TCP
+
+            - role: worker
+              image: {{ kind_node_image }}
+
+            - role: worker
+              image: {{ kind_node_image }}
+
+    - name: Create Kind cluster with 1 control-plane and 2 workers
+      shell: |
+        set -e
+        kind create cluster \
+          --name "{{ kind_cluster_name }}" \
+          --config /tmp/kind-rancher-config.yaml
+      args:
+        executable: /bin/bash
+      when: kind_cluster_check.rc != 0
+
+    - name: Export kubeconfig for root
+      shell: |
+        kind export kubeconfig \
+          --name "{{ kind_cluster_name }}" \
+          --kubeconfig /root/.kube/config
+      args:
+        executable: /bin/bash
+
+    - name: Copy kubeconfig to azureuser
+      copy:
+        src: /root/.kube/config
+        dest: "/home/{{ remote_user_name }}/.kube/config"
+        remote_src: yes
+        owner: "{{ remote_user_name }}"
+        group: "{{ remote_user_name }}"
+        mode: "0600"
+
+    - name: Wait for Kubernetes API
+      shell: kubectl cluster-info
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: kube_api_check
+      retries: 30
+      delay: 10
+      until: kube_api_check.rc == 0
+
+    - name: Wait for all Kubernetes nodes to become Ready
+      shell: |
+        kubectl wait --for=condition=Ready nodes --all --timeout=300s
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Show Kind nodes
+      shell: kubectl get nodes -o wide
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: kind_nodes
+      changed_when: false
+
+    - name: Print Kind node status
+      debug:
+        var: kind_nodes.stdout_lines
+
+    - name: Install NGINX Ingress Controller for Kind
+      shell: |
+        set -e
+        kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+      args:
+        executable: /bin/bash
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Wait for NGINX Ingress Controller
+      shell: |
+        kubectl wait \
+          --namespace ingress-nginx \
+          --for=condition=ready pod \
+          --selector=app.kubernetes.io/component=controller \
+          --timeout=300s
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Add Helm repositories
+      shell: |
+        set -e
+        helm repo add jetstack https://charts.jetstack.io || true
+        helm repo add rancher-latest https://releases.rancher.com/server-charts/latest || true
+        helm repo update
+      args:
+        executable: /bin/bash
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Create cert-manager namespace
+      shell: |
+        kubectl create namespace cert-manager --dry-run=client -o yaml | kubectl apply -f -
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Install cert-manager
+      shell: |
+        set -e
+        helm upgrade --install cert-manager jetstack/cert-manager \
+          --namespace cert-manager \
+          --version {{ cert_manager_version }} \
+          --set installCRDs=true
+      args:
+        executable: /bin/bash
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Wait for cert-manager deployment
+      shell: |
+        kubectl rollout status deployment/cert-manager -n cert-manager --timeout=300s
+        kubectl rollout status deployment/cert-manager-webhook -n cert-manager --timeout=300s
+        kubectl rollout status deployment/cert-manager-cainjector -n cert-manager --timeout=300s
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Create Rancher namespace
+      shell: |
+        kubectl create namespace cattle-system --dry-run=client -o yaml | kubectl apply -f -
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Install Rancher pinned version
+      shell: |
+        set -e
+        helm upgrade --install rancher rancher-latest/rancher \
+          --namespace cattle-system \
+          --version {{ rancher_version }} \
+          --set hostname={{ rancher_hostname }} \
+          --set replicas=1 \
+          --set bootstrapPassword={{ rancher_bootstrap_password }} \
+          --set ingress.tls.source=rancher
+      args:
+        executable: /bin/bash
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Wait for Rancher rollout
+      shell: |
+        kubectl rollout status deployment/rancher -n cattle-system --timeout=600s
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Create Argo CD namespace
+      shell: |
+        kubectl create namespace {{ argocd_namespace }} --dry-run=client -o yaml | kubectl apply -f -
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Install Argo CD pinned version
+      shell: |
+        set -e
+        kubectl apply -n {{ argocd_namespace }} \
+          --server-side \
+          --force-conflicts \
+          -f https://raw.githubusercontent.com/argoproj/argo-cd/{{ argocd_version }}/manifests/install.yaml
+      args:
+        executable: /bin/bash
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Patch Argo CD server service to NodePort
+      shell: |
+        kubectl patch svc argocd-server -n {{ argocd_namespace }} --type='merge' -p '{
+          "spec": {
+            "type": "NodePort",
+            "ports": [
+              {
+                "name": "http",
+                "port": 80,
+                "protocol": "TCP",
+                "targetPort": 8080,
+                "nodePort": 30080
+              },
+              {
+                "name": "https",
+                "port": 443,
+                "protocol": "TCP",
+                "targetPort": 8080,
+                "nodePort": 30443
+              }
+            ]
+          }
+        }'
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Wait for Argo CD deployments
+      shell: |
+        kubectl rollout status deployment/argocd-server -n {{ argocd_namespace }} --timeout=600s
+        kubectl rollout status deployment/argocd-repo-server -n {{ argocd_namespace }} --timeout=600s
+        kubectl rollout status deployment/argocd-applicationset-controller -n {{ argocd_namespace }} --timeout=600s
+        kubectl rollout status statefulset/argocd-application-controller -n {{ argocd_namespace }} --timeout=600s
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Get Argo CD initial admin password
+      shell: |
+        kubectl -n {{ argocd_namespace }} get secret argocd-initial-admin-secret \
+          -o jsonpath="{.data.password}" | base64 -d
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: argocd_password
+      changed_when: false
+      failed_when: false
+
+    - name: Get Argo CD service
+      shell: kubectl get svc argocd-server -n {{ argocd_namespace }}
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: argocd_svc
+      changed_when: false
+
+    - name: Stop existing Rancher port-forward service if present
+      systemd:
+        name: rancher-port-forward
+        state: stopped
+      failed_when: false
+
+    - name: Stop existing Argo CD port-forward service if present
+      systemd:
+        name: argocd-port-forward
+        state: stopped
+      failed_when: false
+
+    - name: Create Rancher port-forward systemd service
+      copy:
+        dest: /etc/systemd/system/rancher-port-forward.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Rancher Kubernetes Port Forward
+          After=network-online.target docker.service
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User=root
+          Restart=always
+          RestartSec=10
+          ExecStart=/usr/local/bin/kubectl --kubeconfig=/root/.kube/config -n cattle-system port-forward --address 0.0.0.0 svc/rancher {{ rancher_port_forward_host_port }}:{{ rancher_port_forward_service_port }}
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Create Argo CD port-forward systemd service
+      copy:
+        dest: /etc/systemd/system/argocd-port-forward.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Argo CD Kubernetes Port Forward
+          After=network-online.target docker.service
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User=root
+          Restart=always
+          RestartSec=10
+          ExecStart=/usr/local/bin/kubectl --kubeconfig=/root/.kube/config -n {{ argocd_namespace }} port-forward --address 0.0.0.0 svc/argocd-server {{ argocd_port_forward_host_port }}:{{ argocd_port_forward_service_port }}
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd after creating port-forward services
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start Rancher port-forward service
+      systemd:
+        name: rancher-port-forward
+        enabled: yes
+        state: started
+
+    - name: Enable and start Argo CD port-forward service
+      systemd:
+        name: argocd-port-forward
+        enabled: yes
+        state: started
+
+    - name: Verify Rancher port-forward service is running
+      command: systemctl is-active rancher-port-forward
+      register: rancher_pf_status
+      changed_when: false
+      retries: 10
+      delay: 3
+      until: rancher_pf_status.stdout == "active"
+
+    - name: Verify Argo CD port-forward service is running
+      command: systemctl is-active argocd-port-forward
+      register: argocd_pf_status
+      changed_when: false
+      retries: 10
+      delay: 3
+      until: argocd_pf_status.stdout == "active"
+
+    - name: Show listening browser ports
+      shell: |
+        ss -ltnp | grep -E ':({{ rancher_port_forward_host_port }}|{{ argocd_port_forward_host_port }})' || true
+      register: browser_ports
+      changed_when: false
+
+    - name: Print browser port status
+      debug:
+        var: browser_ports.stdout_lines
+
+    - name: Final output
+      debug:
+        msg:
+          - "Installation completed successfully."
+          - "Kind cluster name: {{ kind_cluster_name }}"
+          - "Kubernetes version: {{ kubernetes_version }}"
+          - "Rancher version: {{ rancher_version }}"
+          - "Rancher browser URL using port-forward: https://<AZURE_VM_PUBLIC_IP>:{{ rancher_port_forward_host_port }}"
+          - "Rancher ingress URL also available if hosts file is configured: https://{{ rancher_hostname }}"
+          - "Rancher username: admin"
+          - "Rancher password: {{ rancher_bootstrap_password }}"
+          - "Argo CD browser URL using port-forward: https://<AZURE_VM_PUBLIC_IP>:{{ argocd_port_forward_host_port }}"
+          - "Argo CD NodePort URL also available: https://<AZURE_VM_PUBLIC_IP>:30443"
+          - "Argo CD username: admin"
+          - "Argo CD password: {{ argocd_password.stdout | default('Run password command manually') }}"
+          - "Open Azure NSG inbound ports: {{ rancher_port_forward_host_port }}, {{ argocd_port_forward_host_port }}, 80, 443, 30080, 30443"
+          - "Check Rancher port-forward: sudo systemctl status rancher-port-forward"
+          - "Check Argo CD port-forward: sudo systemctl status argocd-port-forward"
